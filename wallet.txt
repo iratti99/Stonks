@@ -1,4 +1,6 @@
 SLV,
 TSLA,
 B,
-MELI;
+MELI,
+QQQ;
+``` :contentReference[oaicite:0]{index=0}

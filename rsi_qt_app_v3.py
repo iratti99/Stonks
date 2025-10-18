@@ -1,5 +1,8 @@
 import sys
+import os
 from datetime import datetime, timezone
+from typing import List
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -9,6 +12,36 @@ from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+
+WALLET_PATH = "wallet.txt"  # cambia a ruta absoluta si lo prefieres
+
+
+# ----------------------------- Utilidades Wallet ----------------------------- #
+def load_wallet(path: str) -> List[str]:
+    """
+    Lee tickers desde wallet.txt.
+    Formato: instrumentos separados por ',' y la cartera finaliza con ';'.
+    Se ignoran espacios, saltos de línea y entradas duplicadas o vacías.
+    """
+    if not os.path.exists(path):
+        return []
+
+    with open(path, "r", encoding="utf-8") as f:
+        txt = f.read()
+
+    # Tomar solo hasta el primer ';'
+    part = txt.split(';', 1)[0]
+    # Separar por coma
+    raw = part.split(',')
+    # Normalizar y filtrar vacíos
+    tickers, seen = [], set()
+    for r in raw:
+        t = r.strip().upper()
+        if t and t not in seen:
+            tickers.append(t)
+            seen.add(t)
+    return tickers
 
 
 # ----------------------------- Utilidades RSI ----------------------------- #
@@ -199,7 +232,6 @@ class BaseCanvas(FigureCanvas):
         w = min(window, n)
         y_win = y[-w:]
         try:
-            # Modelo sencillo por defecto; si falla, probamos alternativas
             for order in [(1,1,1), (1,0,0), (0,1,1)]:
                 try:
                     fit = ARIMA(y_win, order=order).fit(method_kwargs={"warn_convergence": False})
@@ -218,45 +250,58 @@ class BaseCanvas(FigureCanvas):
 
     @staticmethod
     def _future_index(idx: pd.DatetimeIndex, steps: int):
-        """Construye índices futuros equiespaciados a partir del último delta observado."""
+        """
+        Construye índices futuros equiespaciados a partir del último delta observado
+        y devuelve datetimes naive (sin tz), consistentes con lo observado.
+        """
         if steps <= 0 or idx.size < 2:
             return []
-        last = idx[-1]
-        delta = idx[-1] - idx[-2]
+        base = pd.DatetimeIndex(idx)
+        if base.tz is not None:
+            base = base.tz_convert("UTC").tz_localize(None)
+        last = base[-1]
+        delta = base[-1] - base[-2]
         if not isinstance(delta, pd.Timedelta) or delta <= pd.Timedelta(0):
             delta = pd.Timedelta(minutes=1)
-        fut = [last + (i + 1) * delta for i in range(steps)]
-        return fut
+        return [last + (i + 1) * delta for i in range(steps)]
 
-    def _plot_with_model(self, x_obs, y_obs, idx, model_name: str, steps: int, window: int, clip=None):
-        """Dibuja línea observada + ajuste + proyección según el modelo elegido."""
-        label_map = {"Lineal": "Regresión", "Holt-Winters": "HW (tendencia)", "ARIMA": "ARIMA"}
+    def _plot_with_model(self, x_obs, y_obs, idx, model_name: str, steps: int, window: int, clip=None, show_model=True):
+        """Dibuja línea observada + (opcional) ajuste + proyección según el modelo elegido."""
         self.ax.plot(x_obs, y_obs, linewidth=1.5, label="Observado")
 
+        if not show_model or steps <= 0:
+            return  # no dibuja ajuste/proyección
+
         y_fit = y_future = None
-        if steps > 0:
-            if model_name == "Lineal":
-                y_fit, y_future = self._forecast_lineal(np.array(y_obs), steps, window, clip=clip)
-            elif model_name == "Holt-Winters":
-                y_fit, y_future = self._forecast_holtwinters(np.array(y_obs), steps, window, clip=clip)
-            elif model_name == "ARIMA":
-                y_fit, y_future = self._forecast_arima(np.array(y_obs), steps, window, clip=clip)
+        if model_name == "Lineal":
+            y_fit, y_future = self._forecast_lineal(np.array(y_obs), steps, window, clip=clip)
+        elif model_name == "Holt-Winters":
+            y_fit, y_future = self._forecast_holtwinters(np.array(y_obs), steps, window, clip=clip)
+        elif model_name == "ARIMA":
+            y_fit, y_future = self._forecast_arima(np.array(y_obs), steps, window, clip=clip)
 
         if y_fit is not None:
             x_fit = x_obs[-len(y_fit):]
-            self.ax.plot(x_fit, list(y_fit), linestyle="--", linewidth=1.2, label=label_map.get(model_name, "Ajuste"))
+            self.ax.plot(x_fit, list(y_fit), linestyle="--", linewidth=1.2, label="Regresión/ajuste")
+
         if y_future is not None:
-            fut_idx = self._future_index(idx, steps)
+            fut_idx = self._future_index(pd.DatetimeIndex(x_obs), steps)
             if fut_idx:
-                self.ax.plot(fut_idx, list(y_future), linestyle=":", linewidth=1.5, label="Proyección")
-                self.ax.scatter([fut_idx[-1]], [float(y_future[-1])], zorder=6)
+                yf_list = list(y_future)
+                if len(yf_list) == 1:
+                    self.ax.plot([x_obs[-1], fut_idx[0]], [y_obs[-1], float(yf_list[0])],
+                                 linestyle=":", linewidth=1.5, label="Proyección")
+                    self.ax.scatter([fut_idx[0]], [float(yf_list[0])], zorder=6)
+                else:
+                    self.ax.plot(fut_idx, yf_list, linestyle=":", linewidth=1.5, label="Proyección")
+                    self.ax.scatter([fut_idx[-1]], [float(yf_list[-1])], zorder=6)
 
 
 class PriceCanvas(BaseCanvas):
     def __init__(self, parent=None):
         super().__init__(title="Precio (Close)", ylim=None, parent=parent)
 
-    def plot_price(self, times, close_series, model_name="Lineal", forecast_steps=0, window=200):
+    def plot_price(self, times, close_series, model_name="Lineal", forecast_steps=0, window=200, show_model=True):
         self._prep()
         if close_series is None:
             self.draw(); return
@@ -273,8 +318,8 @@ class PriceCanvas(BaseCanvas):
         x_obs = list(idx.to_pydatetime())
         y_obs = s.to_numpy(dtype=float).reshape(-1).tolist()
 
-        # Observado + modelo
-        self._plot_with_model(x_obs, y_obs, idx, model_name, forecast_steps, window, clip=None)
+        # Observado + (opcional) modelo
+        self._plot_with_model(x_obs, y_obs, idx, model_name, forecast_steps, window, clip=None, show_model=show_model)
         self._annotate_min_max(self.ax, x_obs, y_obs, fmt="{:.2f}")
         self.ax.legend(loc="best")
         self.ax.set_ylabel("Precio")
@@ -285,7 +330,7 @@ class RsiCanvas(BaseCanvas):
     def __init__(self, parent=None):
         super().__init__(title="RSI(14)", ylim=(0, 100), parent=parent)
 
-    def plot_rsi(self, times, rsi_series, model_name="Lineal", forecast_steps=0, window=200):
+    def plot_rsi(self, times, rsi_series, model_name="Lineal", forecast_steps=0, window=200, show_model=True):
         self._prep()
         if rsi_series is None:
             self.draw(); return
@@ -302,11 +347,18 @@ class RsiCanvas(BaseCanvas):
         x_obs = list(idx.to_pydatetime())
         y_obs = s.to_numpy(dtype=float).reshape(-1).tolist()
 
-        # Observado + modelo (con recorte 0-100)
-        self._plot_with_model(x_obs, y_obs, idx, model_name, forecast_steps, window, clip=(0, 100))
-        # Líneas 30/70 y min/max
-        self.ax.axhline(70, linestyle="--")
-        self.ax.axhline(30, linestyle="--")
+        # Observado + (opcional) modelo (con recorte 0-100)
+        self._plot_with_model(x_obs, y_obs, idx, model_name, forecast_steps, window, clip=(0, 100), show_model=show_model)
+
+        # Líneas de referencia RSI 
+        # Criticas
+        self.ax.axhline(70, color="red", linestyle="--", linewidth=0.5)
+        self.ax.axhline(30, color="red", linestyle="--", linewidth=0.5)
+        # Normales
+        self.ax.axhline(55, color="green", linestyle="--", linewidth=1)
+        self.ax.axhline(45, color="green", linestyle="--", linewidth=1)
+
+        # Min/Max
         self._annotate_min_max(self.ax, x_obs, y_obs, fmt="{:.1f}")
 
         self.ax.legend(loc="best")
@@ -320,10 +372,13 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
 
         self.setWindowTitle("RSI Monitor - EconometricaGPT")
-        self.resize(1200, 880)
+        self.resize(1240, 920)
 
-        # Widgets de control
-        self.symbol_edit = QtWidgets.QLineEdit("AAPL")
+        # --------- Controles superiores (sin buscador) --------- #
+        self.wallet_combo = QtWidgets.QComboBox()
+        self.btn_reload_wallet = QtWidgets.QPushButton("Recargar wallet")
+
+        # Intervalo / Periodo / Refresco
         self.interval_combo = QtWidgets.QComboBox()
         self.interval_combo.addItems(["1m", "5m", "15m", "30m", "60m", "1d"])
         self.period_combo = QtWidgets.QComboBox()
@@ -333,7 +388,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_spin.setValue(60)
         self.refresh_spin.setSuffix(" s")
 
-        # Selectores de proyección
+        # Proyección
         self.horizon_combo = QtWidgets.QComboBox()
         self.horizon_combo.addItems(["1m", "1h", "1d"])
         self.model_combo = QtWidgets.QComboBox()
@@ -342,6 +397,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.window_spin.setRange(30, 2000)
         self.window_spin.setValue(200)
         self.window_spin.setSuffix(" pts")
+
+        # Casilla para mostrar/ocultar regresión/proyección
+        self.chk_show_model = QtWidgets.QCheckBox("Mostrar regresión/proyección")
+        self.chk_show_model.setChecked(True)
 
         self.btn_start = QtWidgets.QPushButton("Iniciar")
         self.btn_stop = QtWidgets.QPushButton("Detener")
@@ -365,16 +424,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.price_canvas = PriceCanvas(self)
         self.rsi_canvas = RsiCanvas(self)
 
-        # Layout superior (controles)
+        # --------- Layout --------- #
         controls_layout = QtWidgets.QGridLayout()
-        controls_layout.addWidget(QtWidgets.QLabel("Símbolo:"), 0, 0)
-        controls_layout.addWidget(self.symbol_edit, 0, 1)
-        controls_layout.addWidget(QtWidgets.QLabel("Intervalo:"), 0, 2)
-        controls_layout.addWidget(self.interval_combo, 0, 3)
-        controls_layout.addWidget(QtWidgets.QLabel("Periodo:"), 0, 4)
-        controls_layout.addWidget(self.period_combo, 0, 5)
-        controls_layout.addWidget(QtWidgets.QLabel("Refresco:"), 0, 6)
-        controls_layout.addWidget(self.refresh_spin, 0, 7)
+        controls_layout.addWidget(QtWidgets.QLabel("Wallet:"), 0, 0)
+        controls_layout.addWidget(self.wallet_combo, 0, 1, 1, 2)
+        controls_layout.addWidget(self.btn_reload_wallet, 0, 3)
+
+        controls_layout.addWidget(QtWidgets.QLabel("Intervalo:"), 0, 4)
+        controls_layout.addWidget(self.interval_combo, 0, 5)
+        controls_layout.addWidget(QtWidgets.QLabel("Periodo:"), 0, 6)
+        controls_layout.addWidget(self.period_combo, 0, 7)
+        controls_layout.addWidget(QtWidgets.QLabel("Refresco:"), 0, 8)
+        controls_layout.addWidget(self.refresh_spin, 0, 9)
 
         controls_layout.addWidget(QtWidgets.QLabel("Proyección:"), 1, 0)
         controls_layout.addWidget(self.horizon_combo, 1, 1)
@@ -382,18 +443,17 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_layout.addWidget(self.model_combo, 1, 3)
         controls_layout.addWidget(QtWidgets.QLabel("Ventana:"), 1, 4)
         controls_layout.addWidget(self.window_spin, 1, 5)
+        controls_layout.addWidget(self.chk_show_model, 1, 6, 1, 2)
 
         controls_layout.addWidget(self.btn_start, 1, 10)
         controls_layout.addWidget(self.btn_stop, 1, 11)
 
-        # Layout señales
         signals_layout = QtWidgets.QHBoxLayout()
         signals_layout.addWidget(self.signal_label)
         signals_layout.addSpacing(30)
         signals_layout.addWidget(self.trend_label)
         signals_layout.addStretch()
 
-        # Layout central
         central = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(central)
         v.addLayout(controls_layout)
@@ -404,23 +464,48 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(self.status_label)
         self.setCentralWidget(central)
 
-        # Timer de refresco
+        # Timer
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_data)
 
-        # Señales botones
+        # Señales
         self.btn_start.clicked.connect(self.start)
         self.btn_stop.clicked.connect(self.stop)
+        self.btn_reload_wallet.clicked.connect(self.reload_wallet)
+        self.wallet_combo.currentIndexChanged.connect(self.refresh_data)
         self.horizon_combo.currentIndexChanged.connect(self.refresh_data)
         self.model_combo.currentIndexChanged.connect(self.refresh_data)
         self.window_spin.valueChanged.connect(self.refresh_data)
+        self.interval_combo.currentIndexChanged.connect(self.refresh_data)
+        self.period_combo.currentIndexChanged.connect(self.refresh_data)
+        self.chk_show_model.stateChanged.connect(self.refresh_data)
 
         # Worker & cache
         self.worker = None
         self.last_df = None
         self.last_name = "-"
 
+        # Cargar wallet al iniciar
+        self.reload_wallet(initial=True)
+
     # ------------------ Lógica de la app ------------------ #
+    def reload_wallet(self, initial=False):
+        tickers = load_wallet(WALLET_PATH)
+        self.wallet_combo.blockSignals(True)
+        self.wallet_combo.clear()
+        if tickers:
+            self.wallet_combo.addItems(tickers)
+        else:
+            self.wallet_combo.addItem("-SIN TICKERS-")
+        self.wallet_combo.blockSignals(False)
+        if not initial:
+            self.status_label.setText("Wallet recargada.")
+            self.refresh_data()
+
+    def current_symbol(self) -> str:
+        sym = self.wallet_combo.currentText().strip().upper()
+        return "" if sym == "-SIN TICKERS-" else sym
+
     def start(self):
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -441,14 +526,17 @@ class MainWindow(QtWidgets.QMainWindow):
         return {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "1d": 1440}.get(txt, 1)
 
     def _horizon_to_steps(self, interval_txt: str, horizon_txt: str) -> int:
-        """Convierte el horizonte (1m/1h/1d) a 'steps' según el intervalo actual."""
         int_min = self._interval_minutes(interval_txt)
         hor_min = {"1m": 1, "1h": 60, "1d": 1440}[horizon_txt]
         steps = int(np.ceil(hor_min / int_min))
         return max(1, steps)
 
     def refresh_data(self):
-        symbol = self.symbol_edit.text().strip().upper()
+        symbol = self.current_symbol()
+        if not symbol:
+            self.status_label.setText("Agrega tickers a wallet.txt (separados por ',' y termina con ';').")
+            return
+
         interval = self.interval_combo.currentText()
         period = self.period_combo.currentText()
 
@@ -474,13 +562,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_data_ready(self, df: pd.DataFrame, instrument_name: str):
         self.last_df = df.copy()
-        self.last_name = instrument_name or self.symbol_edit.text().strip().upper()
+        self.last_name = instrument_name or self.current_symbol()
         try:
-            # 1) Título
-            sym = self.symbol_edit.text().strip().upper()
+            sym = self.current_symbol()
             self.instrument_title.setText(f"Instrumento: {self.last_name} ({sym})")
 
-            # 2) Close como Series 1D float (defensa si viene DataFrame)
+            # Close -> Series 1D float
             close_raw = df["Close"]
             if isinstance(close_raw, pd.DataFrame):
                 close_raw = close_raw.iloc[:, 0]
@@ -489,23 +576,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.status_label.setText("Sin suficientes datos para graficar.")
                 return
 
-            # 3) RSI
+            # RSI
             rsi = compute_rsi(close, period=14)
 
-            # 4) Proyección: parámetros desde la UI
+            # Parámetros de proyección
             horizon = self.horizon_combo.currentText()
             interval_txt = self.interval_combo.currentText()
             steps = self._horizon_to_steps(interval_txt, horizon)
             model_name = self.model_combo.currentText()
             window = int(self.window_spin.value())
+            show_model = self.chk_show_model.isChecked()
 
-            # 5) Dibujar con modelo elegido
-            self.price_canvas.plot_price(close.index, close,
-                                         model_name=model_name, forecast_steps=steps, window=window)
-            self.rsi_canvas.plot_rsi(close.index, rsi,
-                                     model_name=model_name, forecast_steps=steps, window=window)
+            # Dibujar
+            self.price_canvas.plot_price(
+                close.index, close,
+                model_name=model_name, forecast_steps=steps, window=window, show_model=show_model
+            )
+            self.rsi_canvas.plot_rsi(
+                close.index, rsi,
+                model_name=model_name, forecast_steps=steps, window=window, show_model=show_model
+            )
 
-            # 6) Señales RSI
+            # Señales RSI
             s = rsi.dropna()
             last_rsi = float(s.iloc[-1]) if len(s) else np.nan
             beta, r2 = rsi_trend(rsi, lookback=10)
@@ -524,7 +616,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 trend_txt = "-"
             self.trend_label.setText(f"Tendencia RSI: {trend_txt}")
 
-            # 7) Lag efectivo
+            # Lag efectivo
             last_idx = close.index[-1]
             if getattr(close.index, "tz", None) is not None:
                 last_utc = last_idx.tz_convert("UTC").to_pydatetime()
@@ -539,7 +631,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.status_label.setText(
                 f"Última barra: {last_local} | Filas: {len(df)} | Lag aprox: {lag_sec:.1f}s | "
-                f"Proyección: {horizon} | Modelo: {model_name} | Ventana: {window}"
+                f"Proyección: {horizon} | Modelo: {model_name} | Ventana: {window} | "
+                f"Regresión: {'ON' if show_model else 'OFF'}"
             )
 
         except Exception as e:
