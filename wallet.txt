@@ -1,0 +1,4 @@
+SLV,
+TSLA,
+B,
+MELI;
