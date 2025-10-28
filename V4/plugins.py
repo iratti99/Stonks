@@ -1,237 +1,123 @@
-"""
-plugins.py — Arquitectura de *plugins* de gráficos para tu app PyQt6
-
-Objetivo
---------
-Centraliza TODA la lógica que **genera gráficos** en un módulo único y extensible.
-Con esto, en `rsi_qt_app_v4.py` solo creas el manejador de pestañas y le pasas
-los datos + contexto. Para agregar un gráfico nuevo, implementás un plugin y lo
-registrás: sin tocar el resto.
-
-Estructura
----------
-- BasePlugin: interfaz mínima de un plugin de gráfico.
-- PluginTabsManager (QTabWidget): contenedor de pestañas que registra plugins y
-  los actualiza a todos con `update_all(...)`.
-- PricePlugin: gráfico de precio con proyección (Lineal/Holt-Winters/ARIMA-like).
-- RSIPlugin: gráfico de RSI con líneas 30/70 y proyección.
-- IndicatorsPlugin: envoltura para `IndicatorTabs` (MACD/SMA/Volumen/CaroBarato/OBV/MFI).
-
-Uso en tu app (ejemplo mínimo)
-------------------------------
-from plugins import PluginTabsManager, PricePlugin, RSIPlugin, IndicatorsPlugin
-
-# En __init__ de tu MainWindow
-self.plugins = PluginTabsManager(parent=self)
-self.plugins.add_plugin(PricePlugin())
-self.plugins.add_plugin(RSIPlugin())
-self.plugins.add_plugin(IndicatorsPlugin())
-layout.addWidget(self.plugins)
-
-# En on_data_ready(df, ticker, ...)
-ctx = {
-    "unit": self.unit_combo.currentText(),
-    "model_name": self.model_combo.currentText(),
-    "forecast_steps": self._horizon_to_steps(self._last_interval_txt, self.horizon_combo.currentText()),
-    "window": self.window_spin.value(),
-    "show_model": self.chk_show_model.isChecked(),
-}
-self.plugins.update_all(df, ticker, ctx)
-
-Extender
---------
-Para crear otro gráfico:
-class MiPlugin(BasePlugin):
-    name = "Mi Gráfico"
-    def __init__(self):
-        super().__init__()
-        # crear self.widget (por ejemplo un MatplotlibCanvas)
-    def update_data(self, df, ticker, ctx):
-        # dibujar con df y parámetros de ctx
-
-self.plugins.add_plugin(MiPlugin())
-
-Requisitos de DF: columnas ['Open','High','Low','Close','Volume'] y DatetimeIndex.
-"""
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Protocol
 
 import numpy as np
 import pandas as pd
-
 from PyQt6 import QtWidgets
-from PyQt6.QtCore import Qt
-
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from matplotlib.ticker import FuncFormatter
 
-# Reusamos tu módulo existente de indicadores
-try:
-    from indicadores_tabs import IndicatorTabs
-except Exception:
-    IndicatorTabs = None  # permite importar aunque aún no exista el archivo
+# ============================================================= #
+# NORMALIZACIÓN OHLCV (robusta para yfinance)
+# ============================================================= #
+def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve DataFrame con columnas estándar: Open, High, Low, Close, Volume.
+    - Acepta minúsculas / MultiIndex.
+    - Usa 'Adj Close' si no hay 'Close'.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(-1)
+
+    mapping = {c.lower(): c for c in out.columns}
+
+    def pick(*names):
+        for n in names:
+            if n in mapping:
+                return mapping[n]
+        return None
+
+    col_open  = pick("open")
+    col_high  = pick("high")
+    col_low   = pick("low")
+    col_close = pick("close") or pick("adj close", "adj_close", "adjusted close")
+    col_vol   = pick("volume", "vol")
+
+    cols = {}
+    if col_open:  cols["Open"]   = out[col_open]
+    if col_high:  cols["High"]   = out[col_high]
+    if col_low:   cols["Low"]    = out[col_low]
+    if col_close: cols["Close"]  = out[col_close]
+    if col_vol:   cols["Volume"] = out[col_vol]
+
+    if set(cols.keys()) != {"Open","High","Low","Close","Volume"}:
+        return pd.DataFrame()
+    return pd.DataFrame(cols, index=out.index)
 
 
-# ============================ Utilidades comunes ============================ #
-
-class MatplotlibCanvas(FigureCanvas):
-    """Canvas simple con helpers para líneas, rejilla y título."""
-    def __init__(self, title: str = "", ylim: Optional[tuple] = None, parent: Optional[QtWidgets.QWidget] = None):
-        fig = Figure(figsize=(8, 3.6), tight_layout=True)
+# ============================================================= #
+# Lienzo base Matplotlib
+# ============================================================= #
+class PlotCanvas(FigureCanvas):
+    def __init__(self, title: str):
+        fig = Figure(figsize=(6, 4), tight_layout=True)
         super().__init__(fig)
         self.ax = fig.add_subplot(111)
         self.title = title
-        self.ylim = ylim
 
-    def prep(self):
+    def clear_plot(self):
         self.ax.clear()
-        if self.title:
-            self.ax.set_title(self.title)
-        if self.ylim:
-            self.ax.set_ylim(*self.ylim)
-        self.ax.grid(True, which="both", linestyle="--", alpha=0.3)
+        self.ax.set_title(self.title)
+        self.ax.grid(True, alpha=0.3)
 
-    @staticmethod
-    def annotate_minmax(ax, x_list, y_series, yoffset=0, fmt="{:.2f}"):
-        if y_series is None or len(y_series) == 0:
-            return
-        y_arr = np.asarray(y_series, dtype=float)
-        if np.all(np.isnan(y_arr)):
-            return
-        i_min = int(np.nanargmin(y_arr)); i_max = int(np.nanargmax(y_arr))
-        vmin = float(y_arr[i_min]); vmax = float(y_arr[i_max])
-        ax.scatter([x_list[i_min]], [vmin], s=40, color="green", zorder=5)
-        ax.scatter([x_list[i_max]], [vmax], s=40, color="red", zorder=5)
-        ax.annotate(fmt.format(vmin), xy=(x_list[i_min], vmin), xytext=(0, -12 + yoffset),
-                    textcoords="offset points", ha="center", va="top", fontsize=9, color="green",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="green", lw=0.6, alpha=0.8))
-        ax.annotate(fmt.format(vmax), xy=(x_list[i_max], vmax), xytext=(0, 12 + yoffset),
-                    textcoords="offset points", ha="center", va="bottom", fontsize=9, color="red",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="red", lw=0.6, alpha=0.8))
+    def draw_plot(self):
+        self.figure.tight_layout()
+        self.draw_idle()
 
 
-# ============================ Modelos sencillos (internos al plugin) ============================ #
-
-def linear_fit_forecast(y: np.ndarray, steps: int, window: int = 200):
-    if len(y) < 3:
-        return y, np.array([])
-    w = min(window, len(y))
-    x = np.arange(w); ys = y[-w:]
-    A = np.vstack([x, np.ones_like(x)]).T
-    m, b = np.linalg.lstsq(A, ys, rcond=None)[0]
-    y_hat = m * x + b
-    x_fut = np.arange(w, w + steps)
-    y_fut = m * x_fut + b
-    return y_hat, y_fut
-
-
-def holt_winters_like(y: np.ndarray, steps: int, alpha: float = 0.4):
-    if len(y) == 0:
-        return y, np.array([])
-    s = np.zeros_like(y); s[0] = y[0]
-    for i in range(1, len(y)):
-        s[i] = alpha * y[i] + (1 - alpha) * s[i - 1]
-    return s, np.full(steps, s[-1] if len(s) else np.nan)
-
-
-def arima_like(y: np.ndarray, steps: int):
-    return y, np.full(steps, y[-1] if len(y) else np.nan)
-
-
-# ============================ Interfaz de Plugin ============================ #
-
-class BasePlugin(Protocol):
-    """Interfaz mínima: nombre visible, widget (QtWidget) y actualización."""
-    name: str
-    widget: QtWidgets.QWidget
-    def update_data(self, df: pd.DataFrame, ticker: str, ctx: Dict):
-        ...
-
-
-class PluginTabsManager(QtWidgets.QTabWidget):
-    """Contenedor de pestañas para plugins de gráficos."""
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
-        super().__init__(parent)
-        self.setTabPosition(QtWidgets.QTabWidget.TabPosition.North)
-        self._plugins: List[BasePlugin] = []
-
-    def add_plugin(self, plugin: BasePlugin):
-        self._plugins.append(plugin)
-        self.addTab(plugin.widget, plugin.name)
-
-    def update_all(self, df: pd.DataFrame, ticker: str, ctx: Optional[Dict] = None):
-        ctx = ctx or {}
-        for p in self._plugins:
-            try:
-                p.update_data(df, ticker, ctx)
-            except Exception as e:
-                print(f"Plugin '{p.name}' falló en update_data: {e}")
-
-
-# ============================ Plugins concretos ============================ #
-
-class PricePlugin:
+# ============================================================= #
+# Plugins concretos
+# ============================================================= #
+class PricePlugin(QtWidgets.QWidget):
     name = "Precio"
-    def __init__(self):
-        self.canvas = MatplotlibCanvas(title="Precio (Close)")
-        self.widget = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(self.widget)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QVBoxLayout(self)
+        self.canvas = PlotCanvas("Precio (Close)")
         lay.addWidget(self.canvas)
 
-    def _make_formatter(self, unit: str):
-        symbol = "US$" if unit == "USD" else "$"
-        def _fmt(y, _):
-            try:
-                return f"{symbol}{y:,.2f}".replace(",","X").replace(".",",").replace("X",".")
-            except Exception:
-                return f"{symbol}{y}"
-        return FuncFormatter(_fmt)
+    def update_data(self, df: pd.DataFrame, ticker: str, ctx: dict):
+        df = normalize_ohlcv(df)
+        self.canvas.clear_plot()
+        if df.empty:
+            self.canvas.ax.text(0.5, 0.5, "Sin datos válidos", ha="center", va="center",
+                                transform=self.canvas.ax.transAxes)
+            self.canvas.draw_plot()
+            return
 
-    def update_data(self, df: pd.DataFrame, ticker: str, ctx: Dict):
         unit = ctx.get("unit", "USD")
-        model_name = ctx.get("model_name", "Lineal")
-        steps = int(ctx.get("forecast_steps", 0))
-        window = int(ctx.get("window", 200))
-        show_model = bool(ctx.get("show_model", True))
+        currency_native = ctx.get("currency_native", "USD").upper()
+        usd_value = float(ctx.get("usd_value", 0.0) or 0.0)
 
         close = df["Close"].astype(float)
+        if unit == "ARS" and currency_native == "USD" and usd_value > 0:
+            close = close * usd_value
+        elif unit == "USD" and currency_native == "ARS" and usd_value > 0:
+            close = close / usd_value
+
         times = df.index.to_pydatetime()
-        y = np.asarray(close, dtype=float)
+        # Cortar gaps >4h para evitar “rectas”
+        mask = np.diff(pd.Series(times).astype("int64")/1e9, prepend=times[0].timestamp()) < 60*60*4
 
-        ax = self.canvas.ax
-        self.canvas.prep()
-        ax.plot(times, y, linewidth=1.5, label=f"{ticker} Close")
-
-        if show_model and len(y) > 2:
-            if model_name == "Lineal":
-                y_hat, y_future = linear_fit_forecast(y, steps, window=window)
-            elif model_name == "Holt-Winters":
-                y_hat, y_future = holt_winters_like(y, steps)
-            else:
-                y_hat, y_future = arima_like(y, steps)
-            idx_hat = times[-len(y_hat):] if len(y_hat) <= len(times) else times
-            ax.plot(idx_hat, y_hat, linestyle="--", linewidth=1.2, label=f"Ajuste {model_name}")
-            if len(y_future) > 0:
-                fut_idx = pd.date_range(times[-1], periods=len(y_future)+1, freq=pd.infer_freq(pd.Index(times)) or 'D')[1:]
-                ax.plot(fut_idx, y_future, linestyle=":", linewidth=1.5, label="Proyección")
-
-        MatplotlibCanvas.annotate_minmax(ax, times, close, yoffset=0)
-        ax.set_ylabel(f"Close ({unit})")
-        ax.yaxis.set_major_formatter(self._make_formatter(unit))
-        ax.legend(loc="best")
-        self.canvas.draw()
+        self.canvas.ax.plot(np.array(times)[mask], close[mask], linewidth=1.5, label=f"{ticker} Close")
+        self.canvas.ax.set_ylabel(f"Close ({unit})")
+        self.canvas.ax.legend(loc="best")
+        self.canvas.draw_plot()
 
 
-class RSIPlugin:
+class RSIPlugin(QtWidgets.QWidget):
     name = "RSI"
-    def __init__(self, period: int = 14):
+
+    def __init__(self, parent=None, period: int = 14):
+        super().__init__(parent)
         self.period = period
-        self.canvas = MatplotlibCanvas(title=f"RSI({period})", ylim=(0, 100))
-        self.widget = QtWidgets.QWidget()
-        lay = QtWidgets.QVBoxLayout(self.widget)
+        lay = QtWidgets.QVBoxLayout(self)
+        self.canvas = PlotCanvas(f"RSI({period})")
         lay.addWidget(self.canvas)
 
     @staticmethod
@@ -242,82 +128,163 @@ class RSIPlugin:
         roll_up = up.ewm(alpha=1/period, adjust=False).mean()
         roll_down = down.ewm(alpha=1/period, adjust=False).mean()
         rs = roll_up / (roll_down + 1e-12)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
+        return 100 - (100 / (1 + rs))
 
-    def update_data(self, df: pd.DataFrame, ticker: str, ctx: Dict):
-        model_name = ctx.get("model_name", "Lineal")
-        steps = int(ctx.get("forecast_steps", 0))
-        window = int(ctx.get("window", 200))
-        show_model = bool(ctx.get("show_model", True))
+    def update_data(self, df: pd.DataFrame, ticker: str, ctx: dict):
+        df = normalize_ohlcv(df)
+        self.canvas.clear_plot()
+        if df.empty:
+            self.canvas.ax.text(0.5, 0.5, "Sin datos válidos", ha="center", va="center",
+                                transform=self.canvas.ax.transAxes)
+            self.canvas.draw_plot()
+            return
 
-        close = df["Close"].astype(float)
-        rsi = self.compute_rsi(close, period=self.period)
-        y = np.asarray(rsi, dtype=float)
+        rsi = self.compute_rsi(df["Close"].astype(float), period=self.period)
         times = df.index.to_pydatetime()
+        mask = np.diff(pd.Series(times).astype("int64")/1e9, prepend=times[0].timestamp()) < 60*60*4
 
-        ax = self.canvas.ax
-        self.canvas.prep()
-        ax.plot(times, y, linewidth=1.5, label="RSI")
-        ax.axhline(70, linestyle="--", linewidth=1.0, alpha=0.6)
-        ax.axhline(30, linestyle="--", linewidth=1.0, alpha=0.6)
-
-        if show_model and len(y) > 2:
-            if model_name == "Lineal":
-                y_hat, y_future = linear_fit_forecast(y, steps, window=window)
-            elif model_name == "Holt-Winters":
-                y_hat, y_future = holt_winters_like(y, steps)
-            else:
-                y_hat, y_future = arima_like(y, steps)
-            idx_hat = times[-len(y_hat):] if len(y_hat) <= len(times) else times
-            ax.plot(idx_hat, y_hat, linestyle="--", linewidth=1.2, label=f"Ajuste {model_name}")
-            if len(y_future) > 0:
-                fut_idx = pd.date_range(times[-1], periods=len(y_future)+1, freq=pd.infer_freq(pd.Index(times)) or 'D')[1:]
-                ax.plot(fut_idx, y_future, linestyle=":", linewidth=1.5, label="Proyección")
-
-        MatplotlibCanvas.annotate_minmax(ax, times, rsi, yoffset=0)
-        ax.set_ylabel("RSI")
-        ax.legend(loc="best")
-        self.canvas.draw()
+        self.canvas.ax.plot(np.array(times)[mask], rsi[mask], label="RSI", linewidth=1.5)
+        self.canvas.ax.axhline(70, linestyle=":", color="red",  label="Sobrecompra 70")
+        self.canvas.ax.axhline(30, linestyle=":", color="green", label="Sobreventa 30")
+        self.canvas.ax.set_ylim(0, 100)
+        self.canvas.ax.legend(loc="best")
+        self.canvas.draw_plot()
 
 
-class IndicatorsPlugin:
-    """Envoltura para tu `IndicatorTabs` existente como un plugin más."""
+# =============== Indicadores integrados (antes en indicadores_tabs.py) =============== #
+def ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False, min_periods=span).mean()
+
+def calc_sma(df: pd.DataFrame, windows=(20,50,200)) -> pd.DataFrame:
+    out = df.copy()
+    for w in windows:
+        out[f"SMA{w}"] = out["Close"].rolling(window=w, min_periods=w).mean()
+    return out
+
+def calc_macd(df: pd.DataFrame, fast=12, slow=26, signal=9) -> pd.DataFrame:
+    out = df.copy()
+    out["EMA_fast"] = ema(out["Close"], fast)
+    out["EMA_slow"] = ema(out["Close"], slow)
+    out["MACD"] = out["EMA_fast"] - out["EMA_slow"]
+    out["Signal"] = ema(out["MACD"], signal)
+    out["Hist"] = out["MACD"] - out["Signal"]
+    return out
+
+def calc_obv(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    sign = np.sign(out["Close"].diff().fillna(0.0))
+    out["OBV"] = (sign * out["Volume"]).cumsum()
+    return out
+
+def calc_mfi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    out = df.copy()
+    tp = (out["High"] + out["Low"] + out["Close"]) / 3.0
+    rmf = tp * out["Volume"].astype(float)
+    tp_delta = tp.diff()
+    pos_mf = rmf.where(tp_delta > 0, 0.0)
+    neg_mf = rmf.where(tp_delta < 0, 0.0)
+    pmf = pos_mf.rolling(period, min_periods=period).sum()
+    nmf = neg_mf.rolling(period, min_periods=period).sum().abs()
+    ratio = pmf / nmf
+    out["MFI"] = 100 - (100 / (1 + ratio))
+    return out
+
+
+class _PlotWidget(QtWidgets.QWidget):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.canvas = PlotCanvas(title)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(self.canvas)
+
+
+class IndicatorsPlugin(QtWidgets.QTabWidget):
     name = "Indicadores"
-    def __init__(self):
-        if IndicatorTabs is None:
-            raise ImportError("No se encontró 'indicadores_tabs.py'. Coloca ese archivo junto a plugins.py")
-        self._tabs = IndicatorTabs()
-        self.widget = self._tabs  # se usa directamente como pestaña
 
-    def update_data(self, df: pd.DataFrame, ticker: str, ctx: Dict):
-        self._tabs.update_data(df, ticker)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTabPosition(QtWidgets.QTabWidget.TabPosition.North)
+        self.tab_sma = _PlotWidget("SMA 20/50/200")
+        self.tab_macd = _PlotWidget("MACD (12,26,9)")
+        self.tab_vol = _PlotWidget("Volumen")
+        self.tab_val = _PlotWidget("Caro/Barato (SMA200)")
+        self.tab_obv = _PlotWidget("On-Balance Volume (OBV)")
+        self.tab_mfi = _PlotWidget("Money Flow Index (14)")
+        self.addTab(self.tab_sma, "SMA")
+        self.addTab(self.tab_macd, "MACD")
+        self.addTab(self.tab_vol, "Volumen")
+        self.addTab(self.tab_val, "Caro/Barato (SMA)")
+        self.addTab(self.tab_obv, "OBV")
+        self.addTab(self.tab_mfi, "MFI")
+
+    def update_data(self, df: pd.DataFrame, ticker: str, ctx: dict):
+        base = normalize_ohlcv(df)
+        if base.empty:
+            for w in (self.tab_sma, self.tab_macd, self.tab_vol, self.tab_val, self.tab_obv, self.tab_mfi):
+                w.canvas.clear_plot(); w.canvas.draw_plot()
+            return
+
+        # SMA
+        sma = calc_sma(base)
+        ax = self.tab_sma.canvas.ax; self.tab_sma.canvas.clear_plot()
+        ax.plot(sma.index, sma["Close"], label=f"{ticker} Close")
+        for w in (20, 50, 200):
+            ax.plot(sma.index, sma[f"SMA{w}"], label=f"SMA{w}")
+        ax.legend(loc="best"); self.tab_sma.canvas.draw_plot()
+
+        # MACD
+        macd = calc_macd(base)
+        ax = self.tab_macd.canvas.ax; self.tab_macd.canvas.clear_plot()
+        ax.plot(macd.index, macd["MACD"], label="MACD")
+        ax.plot(macd.index, macd["Signal"], linestyle=":", label="Signal")
+        ax.bar(macd.index, macd["Hist"], alpha=0.35, label="Histograma")
+        ax.legend(loc="best"); self.tab_macd.canvas.draw_plot()
+
+        # Volumen
+        ax = self.tab_vol.canvas.ax; self.tab_vol.canvas.clear_plot()
+        ax.bar(base.index, base["Volume"], label="Volumen")
+        ax.legend(loc="best"); self.tab_vol.canvas.draw_plot()
+
+        # Caro/Barato por SMA200
+        val = sma.copy()
+        val["dist_sma"] = (val["Close"] / val["SMA200"] - 1.0)
+        ax = self.tab_val.canvas.ax; self.tab_val.canvas.clear_plot()
+        ax.plot(val.index, val["dist_sma"], label="Distancia a SMA200")
+        ax.axhline(-0.05, linestyle=":", label="Barata ≤ -5%")
+        ax.axhline(+0.05, linestyle=":", label="Cara ≥ +5%")
+        ax.legend(loc="best"); self.tab_val.canvas.draw_plot()
+
+        # OBV
+        obv = calc_obv(base)
+        ax = self.tab_obv.canvas.ax; self.tab_obv.canvas.clear_plot()
+        ax.plot(obv.index, obv["OBV"], label="OBV")
+        ax.legend(loc="best"); self.tab_obv.canvas.draw_plot()
+
+        # MFI
+        mfi = calc_mfi(base)
+        ax = self.tab_mfi.canvas.ax; self.tab_mfi.canvas.clear_plot()
+        ax.plot(mfi.index, mfi["MFI"], label="MFI (14)")
+        ax.axhline(80, linestyle=":", label="Sobrecompra 80")
+        ax.axhline(20, linestyle=":", label="Sobreventa 20")
+        ax.legend(loc="best"); self.tab_mfi.canvas.draw_plot()
 
 
-# ============================ Demo rápida ============================ #
-if __name__ == "__main__":
-    # Demostración independiente con datos de yfinance
-    import yfinance as yf
+# ============================================================= #
+# Contenedor de plugins (pestañas)
+# ============================================================= #
+class PluginTabsManager(QtWidgets.QTabWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._plugins: list[QtWidgets.QWidget] = []
 
-    app = QtWidgets.QApplication([])
+    def add_plugin(self, plugin_widget: QtWidgets.QWidget):
+        self._plugins.append(plugin_widget)
+        name = getattr(plugin_widget, "name", plugin_widget.__class__.__name__)
+        self.addTab(plugin_widget, name)
 
-    w = QtWidgets.QMainWindow(); w.setWindowTitle("Demo Plugins")
-    central = QtWidgets.QWidget(); w.setCentralWidget(central)
-    lay = QtWidgets.QVBoxLayout(central)
-
-    mgr = PluginTabsManager()
-    mgr.add_plugin(PricePlugin())
-    mgr.add_plugin(RSIPlugin())
-    if IndicatorTabs is not None:
-        mgr.add_plugin(IndicatorsPlugin())
-    lay.addWidget(mgr)
-
-    ticker = "AAPL"
-    df = yf.download(ticker, period="6mo", interval="1d", auto_adjust=False)
-    df.index = pd.to_datetime(df.index, utc=True)
-
-    ctx = {"unit": "USD", "model_name": "Lineal", "forecast_steps": 10, "window": 200, "show_model": True}
-    mgr.update_all(df, ticker, ctx)
-
-    w.resize(1100, 800); w.show()
-    app.exec()
+    def update_all(self, df: pd.DataFrame, ticker: str, ctx: dict):
+        for p in self._plugins:
+            try:
+                p.update_data(df, ticker, ctx)
+            except Exception as e:
+                print(f"Plugin '{p}': {e}")
